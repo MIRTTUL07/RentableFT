@@ -76,7 +76,7 @@ A Polygon-compatible wallet (e.g., MetaMask) with testnet MATIC
 Installation
 Clone the repository:
 
-git clone [https://github.com/your-username/your-repo-name.git](https://github.com/your-username/your-repo-name.git)
+git clone [[https://github.com/your-username/your-repo-name.git](https://github.com/your-username/your-repo-name.git)](https://github.com/MIRTTUL07/RentableFT)
 cd your-repo-name
 
 Install dependencies:
