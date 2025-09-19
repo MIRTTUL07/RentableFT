@@ -7,7 +7,7 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 
 /**
  * @title NFTRental
- * @dev Smart contract for renting NFTs
+ * @dev Smart contract for renting and selling NFTs with platform fee support
  */
 contract NFTRental is ReentrancyGuard, Ownable {
     struct RentalListing {
@@ -29,12 +29,16 @@ contract NFTRental is ReentrancyGuard, Ownable {
         uint256 price;
         bool isActive;
     }
-    
+
     mapping(bytes32 => RentalListing) public rentals;
     mapping(bytes32 => SaleListing) public sales;
     mapping(address => mapping(uint256 => bytes32)) public nftToRental;
     mapping(address => mapping(uint256 => bytes32)) public nftToSale;
-    
+
+    // ---------- NEW STATE VARIABLES ----------
+    uint256 public platformFeeBps = 250; // 2.5% default (basis points: 10000 = 100%)
+    address public feeRecipient;
+
     event NFTListedForRent(
         bytes32 indexed rentalId,
         address indexed owner,
@@ -43,7 +47,7 @@ contract NFTRental is ReentrancyGuard, Ownable {
         uint256 dailyRate,
         uint256 collateral
     );
-    
+
     event NFTRented(
         bytes32 indexed rentalId,
         address indexed renter,
@@ -51,7 +55,7 @@ contract NFTRental is ReentrancyGuard, Ownable {
         uint256 endTime,
         uint256 totalCost
     );
-    
+
     event RentalEnded(
         bytes32 indexed rentalId,
         address indexed renter,
@@ -72,7 +76,28 @@ contract NFTRental is ReentrancyGuard, Ownable {
         address indexed seller,
         uint256 price
     );
-    
+
+    // ---------- CONSTRUCTOR ----------
+    constructor() {
+        feeRecipient = msg.sender; // deployer/owner is the default recipient
+    }
+
+    /**
+     * @dev Admin can update platform fee (max 10%)
+     */
+    function setPlatformFee(uint256 _bps) external onlyOwner {
+        require(_bps <= 1000, "Fee too high"); // cap at 10%
+        platformFeeBps = _bps;
+    }
+
+    /**
+     * @dev Admin can change fee recipient
+     */
+    function setFeeRecipient(address _recipient) external onlyOwner {
+        require(_recipient != address(0), "Invalid address");
+        feeRecipient = _recipient;
+    }
+
     /**
      * @dev List an NFT for rent
      */
@@ -85,9 +110,11 @@ contract NFTRental is ReentrancyGuard, Ownable {
         require(IERC721(nftContract).ownerOf(tokenId) == msg.sender, "Not token owner");
         require(dailyRate > 0, "Daily rate must be greater than 0");
         require(collateral > 0, "Collateral must be greater than 0");
-        
-        bytes32 rentalId = keccak256(abi.encodePacked(nftContract, tokenId, msg.sender, block.timestamp));
-        
+
+        bytes32 rentalId = keccak256(
+            abi.encodePacked(nftContract, tokenId, msg.sender, block.timestamp)
+        );
+
         rentals[rentalId] = RentalListing({
             owner: msg.sender,
             renter: address(0),
@@ -99,12 +126,12 @@ contract NFTRental is ReentrancyGuard, Ownable {
             endTime: 0,
             isActive: true
         });
-        
+
         nftToRental[nftContract][tokenId] = rentalId;
-        
+
         emit NFTListedForRent(rentalId, msg.sender, nftContract, tokenId, dailyRate, collateral);
     }
-    
+
     /**
      * @dev Rent an NFT
      */
@@ -113,45 +140,53 @@ contract NFTRental is ReentrancyGuard, Ownable {
         require(rental.isActive, "Rental not active");
         require(rental.renter == address(0), "Already rented");
         require(rentalDays > 0, "Rental days must be greater than 0");
-        
-        uint256 totalCost = rental.dailyRate * rentalDays + rental.collateral;
+
+        uint256 rentAmount = rental.dailyRate * rentalDays;
+        uint256 totalCost = rentAmount + rental.collateral;
         require(msg.value >= totalCost, "Insufficient payment");
-        
+
         rental.renter = msg.sender;
         rental.startTime = block.timestamp;
         rental.endTime = block.timestamp + (rentalDays * 1 days);
-        
+
         // Transfer the NFT to this contract as escrow
         IERC721(rental.nftContract).transferFrom(rental.owner, address(this), rental.tokenId);
-        
-        // Pay the owner (minus collateral which is held in escrow)
-        payable(rental.owner).transfer(rental.dailyRate * rentalDays);
-        
+
+        // ---------- PLATFORM FEE LOGIC ----------
+        uint256 fee = (rentAmount * platformFeeBps) / 10000;
+        payable(feeRecipient).transfer(fee);
+        payable(rental.owner).transfer(rentAmount - fee);
+
         emit NFTRented(rentalId, msg.sender, rental.startTime, rental.endTime, totalCost);
     }
-    
+
     /**
      * @dev End rental and return NFT
      */
     function endRental(bytes32 rentalId) external nonReentrant {
         RentalListing storage rental = rentals[rentalId];
-        require(rental.renter == msg.sender || rental.owner == msg.sender || block.timestamp > rental.endTime, "Unauthorized");
+        require(
+            rental.renter == msg.sender ||
+            rental.owner == msg.sender ||
+            block.timestamp > rental.endTime,
+            "Unauthorized"
+        );
         require(rental.renter != address(0), "Not rented");
-        
+
         // Return NFT to owner
         IERC721(rental.nftContract).transferFrom(address(this), rental.owner, rental.tokenId);
-        
+
         // Return collateral to renter
         payable(rental.renter).transfer(rental.collateral);
-        
+
         emit RentalEnded(rentalId, rental.renter, block.timestamp);
-        
+
         // Reset rental
         rental.renter = address(0);
         rental.startTime = 0;
         rental.endTime = 0;
     }
-    
+
     /**
      * @dev Cancel rental listing
      */
@@ -159,18 +194,18 @@ contract NFTRental is ReentrancyGuard, Ownable {
         RentalListing storage rental = rentals[rentalId];
         require(rental.owner == msg.sender, "Not owner");
         require(rental.renter == address(0), "Cannot cancel active rental");
-        
+
         rental.isActive = false;
         delete nftToRental[rental.nftContract][rental.tokenId];
     }
-    
+
     /**
      * @dev Get rental info
      */
     function getRental(bytes32 rentalId) external view returns (RentalListing memory) {
         return rentals[rentalId];
     }
-    
+
     /**
      * @dev List an NFT for sale
      */
@@ -181,9 +216,11 @@ contract NFTRental is ReentrancyGuard, Ownable {
     ) external nonReentrant {
         require(IERC721(nftContract).ownerOf(tokenId) == msg.sender, "Not token owner");
         require(price > 0, "Price must be greater than 0");
-        
-        bytes32 saleId = keccak256(abi.encodePacked(nftContract, tokenId, msg.sender, block.timestamp, "sale"));
-        
+
+        bytes32 saleId = keccak256(
+            abi.encodePacked(nftContract, tokenId, msg.sender, block.timestamp, "sale")
+        );
+
         sales[saleId] = SaleListing({
             seller: msg.sender,
             nftContract: nftContract,
@@ -191,9 +228,9 @@ contract NFTRental is ReentrancyGuard, Ownable {
             price: price,
             isActive: true
         });
-        
+
         nftToSale[nftContract][tokenId] = saleId;
-        
+
         emit NFTListedForSale(saleId, msg.sender, nftContract, tokenId, price);
     }
 
@@ -205,20 +242,22 @@ contract NFTRental is ReentrancyGuard, Ownable {
         require(sale.isActive, "Sale not active");
         require(msg.value >= sale.price, "Insufficient payment");
         require(msg.sender != sale.seller, "Cannot buy your own NFT");
-        
+
         // Transfer NFT to buyer
         IERC721(sale.nftContract).transferFrom(sale.seller, msg.sender, sale.tokenId);
-        
-        // Pay seller
-        payable(sale.seller).transfer(sale.price);
-        
+
+        // ---------- PLATFORM FEE LOGIC ----------
+        uint256 fee = (sale.price * platformFeeBps) / 10000;
+        payable(feeRecipient).transfer(fee);
+        payable(sale.seller).transfer(sale.price - fee);
+
         // Return excess payment
         if (msg.value > sale.price) {
             payable(msg.sender).transfer(msg.value - sale.price);
         }
-        
+
         emit NFTPurchased(saleId, msg.sender, sale.seller, sale.price);
-        
+
         // Deactivate sale
         sale.isActive = false;
         delete nftToSale[sale.nftContract][sale.tokenId];
@@ -231,7 +270,7 @@ contract NFTRental is ReentrancyGuard, Ownable {
         SaleListing storage sale = sales[saleId];
         require(sale.seller == msg.sender, "Not seller");
         require(sale.isActive, "Sale not active");
-        
+
         sale.isActive = false;
         delete nftToSale[sale.nftContract][sale.tokenId];
     }
@@ -249,7 +288,7 @@ contract NFTRental is ReentrancyGuard, Ownable {
     function isAvailableForRent(address nftContract, uint256 tokenId) external view returns (bool) {
         bytes32 rentalId = nftToRental[nftContract][tokenId];
         if (rentalId == bytes32(0)) return false;
-        
+
         RentalListing memory rental = rentals[rentalId];
         return rental.isActive && rental.renter == address(0);
     }
@@ -260,7 +299,7 @@ contract NFTRental is ReentrancyGuard, Ownable {
     function isAvailableForSale(address nftContract, uint256 tokenId) external view returns (bool) {
         bytes32 saleId = nftToSale[nftContract][tokenId];
         if (saleId == bytes32(0)) return false;
-        
+
         SaleListing memory sale = sales[saleId];
         return sale.isActive;
     }
