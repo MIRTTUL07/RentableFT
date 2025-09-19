@@ -1,0 +1,1 @@
+import{c3 as e,c4 as t}from"./index-vq3aIlo1.js";function o(s,r){if(!e(s,{strict:!1}))throw new t({address:s});if(!e(r,{strict:!1}))throw new t({address:r});return s.toLowerCase()===r.toLowerCase()}export{o as i};
